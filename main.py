@@ -1,63 +1,113 @@
 import json
 import os
-from openai import OpenAI
+import asyncio
+from openai import AsyncOpenAI  # 非同期版クライアントを使用
 from dotenv import load_dotenv
 
 # 環境変数の読み込み
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# AsyncOpenAIを使用します
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# 同時に実行する最大数（GPT-4o-miniなら20〜50程度でも動きますが、まずは10で設定）
+MAX_CONCURRENT_TASKS = 10
 
 def load_json(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
-def solve_math_problem(target_problem, reference_data):
-    # 1. Few-shot用の例を作成（最初の3問を例として提示する簡易版）
-    # ※ 本来はembeddingを使用して類似問題を抽出するとより精度が上がります
-    examples = ""
-    for i, item in enumerate(reference_data[:3]):
-        examples += f"例題{i+1}: {item['question']}\n解答{i+1}: {item['answer']}\n\n"
+def load_jsonl(file_path):
+    data = []
+    if not os.path.exists(file_path):
+        return []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                data.append(json.loads(line))
+    return data
 
-    # 2. システムプロンプトの設定
-    system_prompt = """
-    あなたは優秀な数学の家庭教師です。
-    与えられた問題に対して、以下の手順で回答してください。
-    1. 問題の要点を整理する
-    2. 解法をステップバイステップで説明する
-    3. 最終的な数値を明確に提示する
+def load_problem(file_path):
+    if file_path.endswith('.jsonl'):
+        return load_jsonl(file_path)
+    return load_json(file_path)
+
+def get_field(data: dict, keys, default: str = ""):
+    for k in keys:
+        if k in data and data[k]:
+            return data[k]
+    return default
+
+async def solve_math_problem_async(idx, target_problem, reference_data, semaphore):
     """
-
-    # 3. GPT-4oへのリクエスト
-    user_content = f"""
-    以下の例を参考に、新しい問題を解いてください。
-
-    {examples}
-
-    解くべき問題:
-    {target_problem['question']}
+    1つの問題を解く非同期タスク
     """
+    async with semaphore:  # 同時実行数を制限
+        try:
+            # Few-shot用の例を作成
+            examples = ""
+            for i, item in enumerate(reference_data[:3]):
+                q = get_field(item, ["question", "input", "prompt", "problem"])
+                a = get_field(item, ["answer", "output", "solution"])
+                if q and a:
+                    examples += f"例題{i+1}: {q}\n解答{i+1}: {a}\n\n"
+            
+            system_prompt = "You are a helpful assistant specialized in solving high school level mathematics problems. Provide answers with detailed step-by-step explanations."
 
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ],
-        temperature=0  # 数学問題は決定論的な回答が望ましいため0に設定
-    )
+            target_question = get_field(target_problem, ["question", "input", "prompt", "problem"])
+            if not target_question:
+                return {"id": idx, "prediction": "Error: Question field not found."}
 
-    return response.choices[0].message.content
+            user_content = f"Below are references:\n{examples}\nProblem to solve:\n{target_question}"
 
-def main():
+            # 非同期でのAPI呼び出し
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0
+            )
+            
+            print(f"  [完了] 問題 {idx+1}")
+            return {"id": idx, "prediction": response.choices[0].message.content}
+
+        except Exception as e:
+            print(f"  [エラー] 問題 {idx+1}: {e}")
+            return {"id": idx, "prediction": f"Error during inference: {str(e)}"}
+
+async def main():
     # データのロード
-    train_data = load_json('train_data.json')
-    new_problem = load_json('input_problem.json')
+    train_data = load_jsonl('train_data.jsonl')
+    problems = load_problem('input_problem.jsonl')
+    if isinstance(problems, dict):  # 単一の辞書だった場合のケア
+        problems = [problems]
 
-    print("推論を開始します...")
-    result = solve_math_problem(new_problem, train_data)
+    print(f"推論を開始します... (総問題数: {len(problems)}, 同時実行数: {MAX_CONCURRENT_TASKS})")
     
-    print("\n--- 解答結果 ---")
-    print(result)
+    # セマフォの作成
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+    
+    # 全問題のタスクを作成
+    tasks = [
+        solve_math_problem_async(i, prob, train_data, semaphore) 
+        for i, prob in enumerate(problems)
+    ]
+    
+    # 全タスクを並列実行して結果を待つ
+    results = await asyncio.gather(*tasks)
+
+    # 結果をID順にソート（並列実行だと順番が前後するため）
+    results.sort(key=lambda x: x["id"])
+
+    # 結果の保存
+    output_path = 'output.jsonl'
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for record in results:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    
+    print(f"\nすべての処理が完了しました。結果を {output_path} に保存しました。")
 
 if __name__ == "__main__":
-    main()
+    # 非同期処理の開始
+    asyncio.run(main())
