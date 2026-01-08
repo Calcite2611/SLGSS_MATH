@@ -22,7 +22,7 @@ TEMPERATURE = 0.0
 # paths
 TRAIN_PATH = "train/math_level12_easy_train100_student_with_answer_solution.jsonl"
 TEST_PATH  = "test/math_level12_easy_test100_student.jsonl"  
-OUT_PATH   = "out/preds_test.jsonl"                   
+OUT_PATH   = "out/preds_test_v1.jsonl"                   
 
 print_lock = Lock()
 
@@ -247,7 +247,8 @@ def main():
 
     # train/test を読む
     train_rows = read_jsonl(TRAIN_PATH)
-    test_rows = read_jsonl(TEST_PATH)
+    # test_rows = read_jsonl(TEST_PATH)
+    test_rows = read_jsonl(TRAIN_PATH)
 
     # prompt model
     prompt_model = PromptModel(
